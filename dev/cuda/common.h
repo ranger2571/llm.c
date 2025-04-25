@@ -16,6 +16,7 @@ __host__ __device__ T ceil_div(T dividend, T divisor) {
 __device__ float warpReduceSum(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
         val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+        //主要是允许warp内的线程进行数据交换，而不通过共享内存之类的内存层级
     }
     return val;
 }

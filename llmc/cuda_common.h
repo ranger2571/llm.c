@@ -28,10 +28,11 @@ extern cudaDeviceProp deviceProp;
 
 // WarpSize is not a compile time constant
 // Defining here like this possibly allows the compiler to optimize better
-#define WARP_SIZE 32U
+#define WARP_SIZE 32U//显式定义便于编译器优化warp级操作（如shuffle指令）
 
 // try to make sure that 2 blocks fit on A100/H100 to maximise latency tolerance
 // this needs to be defines rather than queried to be used for __launch_bounds__
+//__CUDA_ARCH__：编译器内置宏，标识目标GPU计算能力
 #if __CUDA_ARCH__ == 800 || __CUDA_ARCH__ >= 900
 #define MAX_1024_THREADS_BLOCKS 2
 #else
@@ -130,16 +131,16 @@ class NvtxRange {
 inline void device_to_file(FILE* dest, void* src, size_t num_bytes, size_t buffer_size, cudaStream_t stream) {
     // allocate pinned buffer for faster, async transfer
     char* buffer_space;
-    cudaCheck(cudaMallocHost(&buffer_space, 2*buffer_size));
+    cudaCheck(cudaMallocHost(&buffer_space, 2*buffer_size));//双倍缓冲区，异步读取和写入，加速计算
     // split allocation in two
-    void* read_buffer = buffer_space;
-    void* write_buffer = buffer_space + buffer_size;
+    void* read_buffer = buffer_space;//地址
+    void* write_buffer = buffer_space + buffer_size;//地址加缓冲区大小
 
     // prime the read buffer; first copy means we have to wait
-    char* gpu_read_ptr = (char*)src;
-    size_t copy_amount = std::min(buffer_size, num_bytes);
+    char* gpu_read_ptr = (char*)src;//首次数据拷贝需要单独等待
+    size_t copy_amount = std::min(buffer_size, num_bytes);//避免过大
     cudaCheck(cudaMemcpyAsync(read_buffer, gpu_read_ptr, copy_amount, cudaMemcpyDeviceToHost, stream));
-    cudaCheck(cudaStreamSynchronize(stream));
+    cudaCheck(cudaStreamSynchronize(stream));//等待拷贝完成
     size_t rest_bytes = num_bytes - copy_amount;
     size_t write_buffer_size = copy_amount;
     gpu_read_ptr += copy_amount;

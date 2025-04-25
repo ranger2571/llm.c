@@ -59,12 +59,16 @@ void adamw_cpu(float* params_memory, const float* grads_memory, float* m_memory,
 // Implements linear interpolation using only two floating-point operations (as opposed to three in a naive implementation).
 // Reference: https://developer.nvidia.com/blog/lerp-faster-cuda
 __device__ inline float lerp(float start, float end, float weight) {
-    return fma(weight, end, fma(-weight, start, start));
+    return fma(weight, end, fma(-weight, start, start));//fma(a,b,c)=a*b+c,且加速执行，降低误差？
 }
 
 // naive fused kernel
 __global__ void adamw_kernel1(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
+    /*
+    直接对全局内存进行编辑
+    没有任何优化
+    */
    int i = blockIdx.x * blockDim.x + threadIdx.x;
    if (i >= num_parameters) return;  // guard
    // update the first moment (momentum)
@@ -82,6 +86,9 @@ __global__ void adamw_kernel1(float* params_memory, const float* grads_memory, f
 __global__ void adamw_kernel2(float* params_memory, const float* grads_memory, float* m_memory, float* v_memory, long num_parameters,
                               float learning_rate, float beta1, float beta2, float beta1_correction, float beta2_correction, float eps, float weight_decay) {
    int i = blockIdx.x * blockDim.x + threadIdx.x;
+   /*
+   加入inline函数，和寄存器，来进行优化？
+   */
    if (i >= num_parameters) return;  // guard
    float grad = grads_memory[i];
    float m = m_memory[i];

@@ -41,6 +41,7 @@ version 7 is softmax optimized for very large C.
 void softmax_forward_cpu(float* out, const float* inp, int N, int C) {
     // inp is (N, C)
     // out is (N, C), each row of inp will get softmaxed
+    // 因为softmax的输出是概率，所以要保证概率和为1，所以减去最大值有利于去做数值稳定，如果不减去最大值，可能会出现数值溢出
     for (int i = 0; i < N; i++) {
         const float* inp_row = inp + i * C;
         float* out_row = out + i * C;
@@ -125,22 +126,22 @@ __global__ void softmax_forward_kernel2(float* out, const float* inp, int N, int
     // inp is (N, C)
     // in each row of C elements, first calculates maxval, then returns expf(val - maxval)
     extern __shared__ float shared[];
-    int idx = blockIdx.x; // ranges [0, N)
-    int tid = threadIdx.x; // ranges [0, block_size)
+    int idx = blockIdx.x; // ranges [0, N)，N就是grid_size
+    int tid = threadIdx.x; // ranges [0, block_size)，一个block处理一个token，也就是一行，有channel个元素，blocksize可能远小于channel数
     int block_size = blockDim.x;
     const float* x = inp + idx * C; // idx-th row of inp
     // thread coarsening
     float maxval = -INFINITY;
     for (int i = tid; i < C; i += block_size) {
-        maxval = fmaxf(maxval, x[i]);
+        maxval = fmaxf(maxval, x[i]);//每一个线程找block_size跨度的最大值
     }
-    shared[tid] = maxval;
+    shared[tid] = maxval;//缓存
     // reductions
     for (int stride = block_size / 2; stride >= 1; stride /= 2) {
         __syncthreads();
         if (tid < stride) {
-            shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
-        }
+            shared[tid] = fmaxf(shared[tid], shared[tid + stride]);//规约找整个channel的最大值
+        }//这里可能就会有bank conflict
     }
     __syncthreads();
     float offset = shared[0];
@@ -179,6 +180,22 @@ __device__ float warpReduceMax(float val) {
     }
     return val;
 }
+/*
+这个函数的作用是在一个warp内部执行规约操作（reduction），计算当前warp所有线程中的最大值。
+每个线程都有一个输入值（变量val），函数的目标是找出这个warp中所有线程的最大值。
+
+利用CUDA提供的内建函数 __shfl_down_sync，它能够让warp内的线程之间交换数据，而无需通过共享内存。
+这里使用的同步掩码0xFFFFFFFF表示所有线程都参与该操作。
+
+在for循环中，offset的初始值为16，然后每次减半。具体来说：
+  a. 当offset为16时，每个线程会从其对应“下方”偏移16个位置的线程中读取一个值，然后用fmaxf计算当前线程的val和该值中的较大者。
+  b. 接下来offset为8、4、2、1，每次都重复这种比较操作，从而逐步将更大的值“传递”给靠前的线程。
+  c. 经过所有循环后，同一个warp中最终会有一个线程（通常是warp的第0号线程）拥有整个warp内所有线程的最大值。
+
+最后函数返回这个最大值。
+
+这种warp内规约技术是针对warp中数据进行快速汇总的常见并行算法，利用内部高速的数据交换机制避免了对共享内存的频繁访问，从而提高性能。
+*/
 
 __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int C) {
     // kernel must use block size of 32
@@ -218,6 +235,8 @@ __global__ void softmax_forward_kernel3(float* out, const float* inp, int N, int
     }
 }
 
+//思路是 使用warpReduceMax结合warp进行加速，每个warp内的线程计算出最大值，然后broadcast给warp内的所有线程，然后计算出整体最大值，然后计算expf，再进行warpReduceSum，最后broadcast给warp内的所有线程，然后计算softmax
+// 同时一个shared mem使用了两次 
 __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int C) {
     // out is (N, C) just like inp. Each row of inp will get softmaxed.
     // same as kernel3, but can handle any block size (multiple of 32)
@@ -245,17 +264,17 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     // first, thread coarsening by directly accessing global memory in series
     float maxval = -INFINITY;
     for (int i = tid; i < C; i += blockDim.x) {
-        maxval = fmaxf(maxval, x[i]);
+        maxval = fmaxf(maxval, x[i]);//将channel归约到 blockDim个线程内
     }
     // now within-warp reductions for maxval
-    maxval = warpReduceMax(maxval);
+    maxval = warpReduceMax(maxval);//对blockDim个线程分成的k个warp内规约，得到k个warp的最大值
 
     // the 0th thread of each warp writes the maxval of that warp to shared memory
-    if (laneId == 0) max_or_sum_storage[warpId] = maxval;
+    if (laneId == 0) max_or_sum_storage[warpId] = maxval;//warp的最大值赋值给shared mem
     __syncthreads();
 
     // now the 0th thread of the block reduces the max values in shared memory, i.e. across warps
-    if (tid == 0) {
+    if (tid == 0) {//每个block的第一个线程计算max_or_sum_storage内的最大值
         float val = max_or_sum_storage[tid];
         for (int i = 1; i < warpsPerBlock; i++) {
             val = fmaxf(val, max_or_sum_storage[i]);
@@ -279,7 +298,7 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
     x = out + idx * C;
     float sumval = 0.0f;
     for (int i = tid; i < C; i += blockDim.x) {
-        sumval += x[i];
+        sumval += x[i];//将channel归约到 blockDim个线程内
     }
     // within-warp reduction for sumval
     sumval = warpReduceSum(sumval);
@@ -305,6 +324,7 @@ __global__ void softmax_forward_kernel4(float* out, const float* inp, int N, int
         out[idx * C + i] = x[i] / sum;
     }
 }
+
 
 __global__ void softmax_forward_online_kernel1(float* out, const float* inp, int N, int C) {
     // inp is (N, C)
@@ -333,6 +353,39 @@ __global__ void softmax_forward_online_kernel1(float* out, const float* inp, int
         }
     }
 }
+
+// __global__ void softmax_forward_online_kernel1 修改是有效的，但是大概只提升了1%，因为没有从物理结构上改进，而是只是修改逻辑，对函数的影响就很小了
+/*
+__global__ void softmax_forward_online_kernel1(float* out, const float* inp, int N, int C) {
+    // inp is (N, C)
+    // out is (N, C), each row of inp will get softmaxed
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < N) {
+        const float* inp_row = inp + i * C;
+        float* out_row = out + i * C;
+
+        float maxval = -INFINITY;
+        float max_val_new = -INFINITY;
+        double sum = 0.0;
+
+        maxval=inp_row[0];
+        sum += exp(inp_row[0]-maxval);
+        max_val_new=maxval;
+
+        for (int j = 1; j < C; j++) {
+			if (inp_row[j] > maxval) {max_val_new = inp_row[j];}
+            sum += exp(inp_row[j]-maxval);
+            sum *=exp(maxval-max_val_new);
+            maxval=max_val_new;
+		}
+
+        for (int j = 0; j < C; j++) {
+            out_row[j] = expf(inp_row[j] - maxval) / sum;
+        }
+    }
+}
+*/
+
 
 // struct for the reduction operation, guarantees 8-byte alignment
 struct __align__(8) SumMax
@@ -655,7 +708,7 @@ int main(int argc, char **argv) {
     srand(0);
 
     int B = 8;
-    int T = 1024;
+    int T = 128;
     int V = 50257;
 
     int deviceIdx = 0;
@@ -688,7 +741,8 @@ int main(int argc, char **argv) {
     }
     printf("Using kernel %d\n", kernel_num);
 
-    int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+    //int block_sizes[] = {32, 64, 128, 256, 512, 1024};
+    int block_sizes[] = {512};
 
     softmax_forward_cpu(out, inp, B * T, V);
     {
@@ -699,28 +753,31 @@ int main(int argc, char **argv) {
         assert(max_el > 1e-4);
         printf("Largest output is: %f\n", max_el);
     }
+    for(int kernel_i=4; kernel_i < 9; ++kernel_i) {
+        // first check the correctness of the kernel
+        for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+            int block_size = block_sizes[j];
+            printf("Checking block size %d.\n", block_size);
+            softmax_forward(kernel_i, d_out, d_inp, B * T, V, block_size);
+            validate_result(d_out, out, "out", B * T * V, 1e-4f);
+        }
 
-    // first check the correctness of the kernel
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-        int block_size = block_sizes[j];
-        printf("Checking block size %d.\n", block_size);
-        softmax_forward(kernel_num, d_out, d_inp, B * T, V, block_size);
-        validate_result(d_out, out, "out", B * T * V, 1e-4f);
+        printf("All results match. Starting benchmarks.\n\n");
+        /*
+        // time the kernel at different block sizes
+        for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
+            int block_size = block_sizes[j];
+
+            int repeat_times = 1;
+            float elapsed_time = benchmark_kernel(repeat_times, softmax_forward,
+                kernel_i, d_out, d_inp, B * T, V, block_size
+                                                );
+
+            printf("block_size %4d | time %.4f ms | per token %.2f µs\n", block_size, elapsed_time, elapsed_time * 1'000 / (B*T));
+        }
+        */
     }
-
-    printf("All results match. Starting benchmarks.\n\n");
-
-    // time the kernel at different block sizes
-    for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
-        int block_size = block_sizes[j];
-
-        int repeat_times = 100;
-        float elapsed_time = benchmark_kernel(repeat_times, softmax_forward,
-                                              kernel_num, d_out, d_inp, B * T, V, block_size
-                                              );
-
-        printf("block_size %4d | time %.4f ms | per token %.2f µs\n", block_size, elapsed_time, elapsed_time * 1'000 / (B*T));
-    }
+    
 
     // free memory
     free(out);

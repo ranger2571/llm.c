@@ -13,13 +13,28 @@
 
 template<class ElementType>
 struct alignas(16) Packed128 {
-    Packed128() = default;
+/*
+关键字 template 表示这是一个模板（泛型）结构体，ElementType 是一个类型参数，使用者可以指定具体的类型，例如 float、int 等。
+关键字 struct 表示定义了一个结构体（可以看作一个类，成员默认是公共的）。
+alignas(16) 表示该结构体的实例在内存中需要按照 16 字节进行对齐，这对于某些需要特定内存对齐要求（例如 SIMD 优化或者 GPU 编程）的场合非常重要。
+Packed128 是该结构体的名字。
+*/
+    Packed128() = default;//自动构造函数
     __device__ explicit Packed128(int4 bits) {
+        /*
+        定义了一个构造函数，它接收一个 int4 类型的参数（int4 是四个整数组成的数据结构，经常用于 CUDA 代码中表示 128 位数据）。
+        关键字 __device__ 表明这个构造函数仅在 GPU 的设备端可用。
+        explicit 表示这个构造函数是明确调用的，避免隐式转换。??什么叫明确调用？？
+        static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");这是一条编译期间检查语句，确保传入的 bits 变量和结构体中存储数据的 payload 数组大小一致，不匹配时编译器将报错，并显示 “Size mismatch.” 错误信息。
+        memcpy(&payload, &bits, sizeof(bits));利用 memcpy 将 bits 中的内存内容复制到 payload 数组中，从而把 int4 数据拷贝到结构体内部。
+        */
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
         memcpy(&payload, &bits, sizeof(bits));
     }
 
+
     __device__  static Packed128 constant(ElementType value) {
+        /*这个函数是静态函数，意思是你不需要创建结构体对象就可以调用它。返回构造好的 result 对象。*/
         Packed128 result;
         for(int k = 0; k < size; ++k) {
             result.payload[k] = value;
@@ -27,19 +42,33 @@ struct alignas(16) Packed128 {
         return result;
     }
     __device__ static Packed128 zeros() {
-        return constant(0.f);
+        return constant(0.f);//生成一个所有值都为0的Packed128对象
     }
     __device__ static Packed128 ones() {
         return constant(1.f);
     }
 
     __device__ ElementType& operator[](int index) {
+        /*（用于非 const 对象）
+        函数重载了“[]”运算符，使得用户可以通过对象[index]的形式访问 payload 数组具体的元素。
+        返回的是对 payload[index] 的引用，可以用来修改对应的元素。
+        */
         return payload[index];
     }
     __device__ const ElementType& operator[](int index) const {
+        /*（用于 const 对象）
+        函数重载了“[]”运算符，用于当 Packed128 对象被定义为常量时使用,
+        用户可以通过对象[index]的形式访问 payload 数组具体的元素。
+        返回的是对 payload[index] 的常量引用，这样确保调用该函数时不会修改 payload 中的数据。*/
         return payload[index];
     }
     __device__ int4 get_bits() const {
+        /*成员函数
+        • 作用是将存储在 payload 数组中的数据转换为 int4 类型并返回。
+        • 声明一个 int4 类型的变量 bits，用来存储结果。
+        • 同样使用 static_assert 检查 bits 与 payload 的大小是否一致。
+        • 使用 memcpy 将 payload 的内存内容复制到 bits 中。
+        • 返回复制后的 bits。这个函数可以用作将内部二进制数据提取为一个四整数的数据块。*/
         int4 bits;
         static_assert(sizeof(bits) == sizeof(payload), "Size mismatch.");
         memcpy(&bits, &payload, sizeof(bits));
@@ -47,32 +76,47 @@ struct alignas(16) Packed128 {
     }
     static constexpr const size_t size = sizeof(int4) / sizeof(ElementType);
     ElementType payload[size];
+    /*
+    static constexpr const size_t size = sizeof(int4) / sizeof(ElementType);
+    这一行定义了一个静态常量 size，它表示 payload 数组中包含多少个 ElementType 类型的元素。计算方法为：将 int4 类型的总字节数除以 ElementType 的字节数。    
+    constexpr 表示这个值在编译期间就会确定，可以用于编译时检查。
+    这样当 ElementType 类型不同时，数组的大小会自动调整以保证整体数据大小与 int4 相同（即 16 字节）。
+    声明了一个数组 payload，该数组每个元素的类型为 ElementType，总共包含 size 个元素。    
+    这就是 Packed128 用来存储实际数据的地方
+    */
 };
 
 // load a Packed128 from an aligned memory address
-template<class ElementType>
+// 从对齐的内存地址中load一个packed128对象
+template<class ElementType>//address是指向元素类型ElementType 的常量指针，要求这个地址对齐，便于 128 位的读取操作。
 __device__ Packed128<ElementType> load128(const ElementType* address) {
     return Packed128<ElementType>{*reinterpret_cast<const int4*>(address)};
+    //使用 reinterpret_cast 将给出的 ElementType 指针转换为 const int4（int4 表示 128 位数据的向量类型，包含4个int型成员）。对转换后的指针进行解引用（*），将其内容读取出来，并利用花括号初始化语法构造出一个 Packed128 实例返回。注意：这个操作要求传入的地址必须按 int4（128 位）要求对齐，否则可能发生未定义行为。
 }
 // load a Packed128 from an aligned memory address with streaming cache hint
 template<class ElementType>
 __device__ Packed128<ElementType> load128cs(const ElementType* address) {
     return Packed128<ElementType>{__ldcs(reinterpret_cast<const int4*>(address))};
+    //CUDA 内置函数 __ldcs，该函数用于从全局内存加载数据，并且提供“流式缓存提示”（cs 表示 cache streaming），加载的数据不会保存在常规 L1 缓存中，适合一次性读入而不必频繁重用的数据。
 }
 // store a Packed128 to an aligned memory address
 template<class ElementType>
 __device__ void store128(ElementType* target, Packed128<ElementType> value) {
     *reinterpret_cast<int4*>(target) = value.get_bits();
+    //将target指针转化为int4指针，然后解引用，将value的数据存储到target中
 }
 // store a Packed128 to an aligned memory address with streaming cache hint
 template<class ElementType>
 __device__ void store128cs(ElementType* target, Packed128<ElementType> value) {
     __stcs(reinterpret_cast<int4*>(target), value.get_bits());
+    //__stcs 是 CUDA 内置的存储函数，专门用于存储数据到全局内存时给予一个流式缓存提示：
+    //该函数调用告诉硬件按照流式缓存方式管理数据，即这种存储方式常用于数据一次写入而不频繁读取的场合，从而避免占用 L1 缓存、减少缓存污染。
 }
 // store a Packed128 to an aligned memory address while caching in L2 but bypassing L1
 template<class ElementType>
 __device__ void store128cg(ElementType* target, Packed128<ElementType> value) {
     __stcg(reinterpret_cast<int4*>(target), value.get_bits());
+    //__stcg 会将数据存入全局内存，但采用的缓存策略是在写入时绕过 L1 缓存，仅缓存到 L2。这在某些应用中可以减少对 L1 缓存的占用，改善内存数据的共享效果或满足特定的硬件优化需求。
 }
 
 // short-form typedefs

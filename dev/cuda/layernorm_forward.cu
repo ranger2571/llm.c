@@ -35,6 +35,18 @@ verstion 5 allocates blocks per row instead of warps per row, same alg as 4 othe
 void layernorm_forward_cpu(float* out, float* mean, float* rstd,
                        const float* inp, const float* weight, const float* bias,
                        int B, int T, int C) {
+    /*
+    // 定义一个在 CPU 上执行前向 LayerNorm 计算的函数，其中：　　
+    // out   ：输出数组，存放归一化并线性变换后的结果。　　
+    // mean  ：输出数组，用于存放每个样本的均值（供反向传播使用）。　　
+    // rstd  ：输出数组，用于存放每个样本的反标准差（1/std）。　　
+    // inp   ：输入数组，待归一化的数据。　　
+    // weight：缩放参数，对归一化后的数据做元素级缩放。　　
+    // bias  ：平移参数，对归一化后的数据做偏置调整。　　
+    // B     ：批次大小。　　
+    // T     ：序列长度或时间步个数。　　
+    // C     ：通道数或每个数据块的特征维度。
+    */
     float eps = 1e-5f;
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
@@ -349,6 +361,7 @@ __global__ void layernorm_forward_kernel6(float* __restrict__ out, float* __rest
     // let's keep everything as x128
     x128* s_weight = reinterpret_cast<x128*>(params);
     x128* s_bias = reinterpret_cast<x128*>(params) + (C / x128::size);
+    //同样将 params 重解释为 x128 指针，但这里 “+ (C / x128::size)” 意味着把指针向后偏移了( C / x128::size )个 x128 元素。也就是说，共享内存的前一段被用来存储权重，共占用了 (C / x128::size) 个 x128 单元，接下来的区域用来存储 bias 数据。本质上，s_bias 指向的内存区域紧跟在 s_weight 后面。
     x128* s_in = reinterpret_cast<x128*>(params) + ((2 + threadIdx.y) * C / x128::size);
 
     int sidx = (threadIdx.x + WARP_SIZE * threadIdx.y) * x128::size;

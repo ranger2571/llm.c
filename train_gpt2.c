@@ -31,6 +31,17 @@ There will be other versions of this code that specialize it and make it fast.
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
 // B = batch_size, T = sequence_length, C = channels, V = vocab_size
+// 所有单独层的前向和反向传播
+// B = 批大小, T = 序列长度, C = 通道数, V = 词汇表大小
+// B = batch_size: 批量大小（Batch Size）是指在训练模型时，一次性输入模型的数据样本数量。
+//     较大的批量大小可以提高内存利用率和训练速度，但也可能需要更多的内存，并且可能影响模型的泛化能力。
+// T = sequence_length: 序列长度（Sequence Length）是指在处理序列数据时，序列中元素的数量。
+//     对于文本数据，这可以是句子中的单词数量；对于时间序列数据，这可以是一系列连续观测值的数量。
+// C = channels: 通道数（Channels）在不同上下文中可能有不同的含义。
+//     在处理图像数据时，它可能指的是颜色通道（如RGB图像有3个通道）。
+//     在处理文本或其他类型的序列数据时，它可能指的是嵌入向量的维度。
+// V = vocab_size: 词汇表大小（Vocabulary Size）是指模型用于表示数据的词汇表中唯一词汇的数量。
+//     在自然语言处理（NLP）任务中，词汇表大小决定了模型可以识别的不同单词或token的数量。
 
 void encoder_forward(float* out,
                    int* inp, float* wte, float* wpe,

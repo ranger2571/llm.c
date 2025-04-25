@@ -83,27 +83,37 @@ static void* cudnn_workspace = NULL;
 void attention_forward_cpu(float* out, float* preatt, float* att,
                        const float* inp,
                        int B, int T, int C, int NH) {
-    // input is (B, T, 3C) Q,K,V
-    // preatt, att are (B, NH, T, T)
+    // input is (B, T, 3C) Q,K,V (batch,seq_len, 3 * channel/hidden_size)
+    // preatt, att are (B, NH, T, T) NH num_heads
     // output is (B, T, C)
     int C3 = C*3;
-    int hs = C / NH; // head size
+    int hs = C / NH; // head size 一个head的channel
     float scale = 1.0 / sqrtf(hs);
 
     for (int b = 0; b < B; b++) {
         for (int t = 0; t < T; t++) {
             for (int h = 0; h < NH; h++) {
+                /*
+                跳过前 b 个批次，即 b * T * (3C)
+                接着跳过前 t 个时间步，每个时间步占 3C
+                再跳过前 h 个头，每个头有 hs 个通道
+                得到当前 batch、时间步、头下的 query 向量
+                */
                 const float* query_t = inp + b * T * C3 + t * C3 + h * hs;
                 float* preatt_bth = preatt + b*NH*T*T + h*T*T + t*T;
                 float* att_bth = att + b*NH*T*T + h*T*T + t*T;
 
                 // pass 1: calculate query dot key and maxval
                 float maxval = -FLT_MAX;
+                // 遍历时间步 t2（只处理 t2 从 0 到 t，因为自回归模型只关注当前及之前的序列）
                 for (int t2 = 0; t2 <= t; t2++) {
+                    // 同样跳过前面 batch 和时间步的部分，再跳过前 h 个头（每个 hs）得到当前 head 的 key 向量。
+                    // “+ C” 表示跳过 Q 部分，直接定位到 K 部分，
                     const float* key_t2 = inp + b * T * C3 + t2 * C3 + h * hs + C; // +C because it's key
 
                     // (query_t) dot (key_t2)
                     float val = 0.0f;
+                    // 对于当前的 head 进行点乘
                     for (int i = 0; i < hs; i++) {
                         val += query_t[i] * key_t2[i];
                     }
@@ -112,7 +122,7 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
                         maxval = val;
                     }
 
-                    preatt_bth[t2] = val;
+                    preatt_bth[t2] = val;//为什么存的是t2呢？
                 }
                 // pad with -INFINITY outside of autoregressive region for debugging comparisons
                 for (int t2 = t+1; t2 < T; t2++) {
@@ -120,6 +130,7 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
                 }
 
                 // pass 2: calculate the exp and keep track of sum
+                // 计算softmax的最大值和求和
                 float expsum = 0.0f;
                 for (int t2 = 0; t2 <= t; t2++) {
                     float expv = expf(preatt_bth[t2] - maxval);
@@ -129,6 +140,7 @@ void attention_forward_cpu(float* out, float* preatt, float* att,
                 float expsum_inv = expsum == 0.0f ? 0.0f : 1.0f / expsum;
 
                 // pass 3: normalize to get the softmax
+                // 缩放，除以和的数值
                 for (int t2 = 0; t2 < T; t2++) {
                     if (t2 <= t) {
                         att_bth[t2] *= expsum_inv;
@@ -163,15 +175,15 @@ __global__ void attention_query_key_kernel1(float* preatt, const float* inp,
     int total_threads = B * NH * T * T;
 
     if (idx < total_threads) {
-        int t2 = idx % T;
-        int t = (idx / T) % T;
+        int t2 = idx % T;//(T)取第二个T
+        int t = (idx / T) % T;//(B * NH *T % T)取第一个T
         if (t2 > t) {
             // autoregressive mask
             preatt[idx] = -INFINITY;
             return;
         }
-        int h = (idx / (T * T)) % NH;
-        int b = idx / (NH * T * T);
+        int h = (idx / (T * T)) % NH;//取NH
+        int b = idx / (NH * T * T);//取B
 
         int C3 = C*3;
         int hs = C / NH; // head size
@@ -1324,7 +1336,9 @@ int main(int argc, char **argv) {
         kernel_num = atoi(argv[1]);
     }
     printf("Using kernel %d\n", kernel_num);
-    int block_sizes[] = {32, 64, 128, 256, 512};
+    //int block_sizes[] = {32, 64, 128, 256, 512};
+    int block_sizes[] = {512};
+
 
     // Lower accuracy requirements for FP16 (1e-4f also too much for TF32 on kernels 3 & 4)
     float accuracy_threshold = (kernel_num <= 4) ? 1e-3f : 1e-2f;
@@ -1334,7 +1348,12 @@ int main(int argc, char **argv) {
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         printf("Checking block size %d.\n", block_size);
-        attention_forward(kernel_num, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+        attention_forward(1, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+        attention_forward(2, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+        attention_forward(3, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+        attention_forward(4, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+        attention_forward(5, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
+        //attention_forward(kernel_num, d_out, d_stats, d_vaccum, d_qkvr, d_preatt, d_att, d_inp, B, T, C, NH, block_size);
         // all kernels should produce the correct output out
         // todo - make accuracy threshold dynamic and depend on FP16 vs FP32?
         validate_result(d_out, out, "out", B * T * C, accuracy_threshold);
@@ -1355,6 +1374,7 @@ int main(int argc, char **argv) {
     first_run_validation = false;
 
     // benchmark speed of the kernel
+    /*
     for (int j = 0; j < sizeof(block_sizes) / sizeof(int); j++) {
         int block_size = block_sizes[j];
         int repeat_times = 100;
@@ -1365,6 +1385,8 @@ int main(int argc, char **argv) {
 
         printf("block_size %4d | time %f ms\n", block_size, elapsed_time);
     }
+    */
+    
 
     // free memory
     free(out);

@@ -27,7 +27,7 @@ float global_norm_cpu(const float* data, size_t count) {
     return (float)acc;
 }
 
-
+// meta_group_size is the number of warps in a block, and meta_group_rank is the warp index
 template<class T>
 __global__ void norm_kernel1(float* out, const T* data, size_t count) {
     // we want as few atomics as possible, so each block tries to do
@@ -35,25 +35,34 @@ __global__ void norm_kernel1(float* out, const T* data, size_t count) {
     // until we run out of data), and then we reduce inside the block
     // and finally have just one atomic per block.
     namespace cg = cooperative_groups;
+    // 取当前线程所在的线程块
     cg::thread_block block = cg::this_thread_block();
+    // 将整个线程块划分为大小为 32 的子组（即 warp），便于后续 warp 内的归约  
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
 
     __shared__ float block_result[32];
 
     // out will be updated atomically from all thread blocks
-    size_t index = threadIdx.x + blockDim.x * blockIdx.x;
+    size_t index = threadIdx.x + blockDim.x * blockIdx.x;//整个grid的thread id
     size_t grid_width = blockDim.x * gridDim.x;
     float accumulator = 0.f;
+    //grid-stride 循环的基本思想是：每个线程从 index 开始，每隔 grid_width 个元素处理一次，确保所有数据都能被遍历。这样做可以适应数据量与线程数不一致的情况，同时均衡负载。
     for(size_t i = index; i < count; i += grid_width) {
-        accumulator += (float)data[i] * (float)data[i];
+        accumulator += (float)data[i] * (float)data[i];//将count大小的数据量，reduce到grid的所有线程中
     }
     // warp-level reduce
-    float warp_result = cg::reduce(warp, accumulator, cg::plus<float>{});
-    block_result[warp.meta_group_rank()] = warp_result;
+    float warp_result = cg::reduce(warp, accumulator, cg::plus<float>{});//将一个warp内的数据reduce到一个寄存器中,warp内所有线程的warp_result相同
+    block_result[warp.meta_group_rank()] = warp_result;//寄存器转移到共享内存中，
+    //warp.meta_group_rank() 返回当前 warp 的编号。每个 warp 的所有线程执行这行代码时，其编号相同（也即所有线程得到的 warp_result 是一样的）注意：通常做法是让 warp 中的一个线程（如 thread_lane==0）写入共享内存；此处代码写法可能暗示所有线程都有机会写入同一位置，但由于 warp 内归约结果相同，所以效果等同于取其中一个。
     block.sync();
+
+    // 只有 warp 中编号为0的线程负责块内的最终归约,调用 atomicAdd 将结果写入全局内存
     if(warp.meta_group_rank() == 0) {
+        // 对于当前 warp 内的线程，如果线程编号小于 warp 的有效线程数，则取共享内存中对应的累加结果，否则设为 0
         float gather = warp.thread_rank() < warp.meta_group_size() ? block_result[warp.thread_rank()] : 0.f;
+        // 对这些结果做归约，得到整个线程块的累积值
         float block_sum = cg::reduce(warp, gather, cg::plus<float>{});
+        // 再由 warp 中第 0 号线程执行原子加，将块的累积值加到全局输出中  
         if(warp.thread_rank() ==  0) {
             atomicAdd(out, block_sum);
         }
@@ -66,6 +75,7 @@ __global__ void norm_kernel2(float* out, const T* data, size_t count) {
     // so there are 2048 * 108 = 221,184 threads total
     // say the block_size is 512, then we would launch 432 blocks in total
     // say num_params is ~100M, each thread will process ~500 elements
+
     // warps reduce with warp-level reduce, we have 221,184/32 = 6,912 warps
     // and then each warp atomicAdd's to global memory, total of 6,912 atomics
 
@@ -145,6 +155,11 @@ void global_norm1(float* out, const T* values, size_t count, int block_size) {
     // one block too many is catastrophic, since it only can start once all the other
     // blocks finish. anyway, I think cuda_threads_per_SM should be a multiple of 512
     // on all gpus, so the division really is going to be exact.
+    /*
+    启动足够的块来填充网格。故意不使用 DIV_CEIL。少一个块会对性能产生很小的影响，而多一个块则会造成灾难性的后果，因为它只能在所有其他块完成后才能启动。无论如何，我认为 cuda_threads_per_SM 在所有 gpu 上都应该是 512 的倍数，因此除法确实是精确的。???没看懂什么意思
+
+    作者的意思可能是，现在能启动的thread的数目已经确定了就是cuda_threads_per_SM * cuda_num_SMs，如果grid的数目比当前的值更大，就会导致资源短缺，有一个block就会需要等待到资源存在空闲才能启动，这会显著的拖慢计算速度
+    */
     const int grid_size = cuda_threads_per_SM * cuda_num_SMs / block_size;
     assert(grid_size > 0);      // gives a better error than letting the call below fail
     norm_kernel1<<<grid_size, block_size>>>(out, values, count);

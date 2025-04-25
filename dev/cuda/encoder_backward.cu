@@ -47,6 +47,14 @@ void encoder_backward_cpu(float* dwte, float* dwpe,
 __global__ void encoder_backward_kernel1(float* dwte, float* dwpe,
                                         const float* dout, const int* inp,
                                         int B, int T, int C) {
+    /*
+    这是一个在 GPU 上执行的全局 kernel，输入参数包含：    
+    - dwte：词嵌入（word token embedding）的梯度输出数组    
+    - dwpe：位置嵌入（word position embedding）的梯度输出数组    
+    - dout：从后续层传回来的梯度数据    
+    - inp：输入索引数组，包含每个位置对应的单词索引    
+    - B, T, C：分别表示 batch 数、序列长度（time steps）和嵌入维度
+    */
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int N = B * T * C;
 
@@ -55,13 +63,13 @@ __global__ void encoder_backward_kernel1(float* dwte, float* dwpe,
         int b = bt / T;
         int t = bt % T;
         int c = idx % C;
-
+        //利用线性索引 b * T + t 访问输入索引数组 inp，得到当前batch和timestep对应的单词索引 ix。该索引用来定位 dwte 数组中对应单词的梯度位置。
         int ix = inp[b * T + t];
 
         const float* dout_btc = dout + b * T * C + t * C + c;
         float* dwte_ix = dwte + ix * C + c;
         float* dwpe_tc = dwpe + t * C + c;
-
+        //原子操作 atomicAdd 将 dout_btc 处的梯度加到对应 dwte_ix 和 dwpe_tc 内。  由于多个线程可能同时对同一位置进行累加，为保证数据安全（防止竞态条件），使用 atomicAdd 进行原子性的加法操作。
         atomicAdd(dwte_ix, *dout_btc);
         atomicAdd(dwpe_tc, *dout_btc);
     }
@@ -75,6 +83,7 @@ __global__ void encoder_backward_kernel2(float* dwte, float* dwpe,
     int c = blockIdx.x * blockDim.x + threadIdx.x;
     if (c >= C) { return; } // guard
     int BT = B * T;
+    //每一个线程只负责一个维度问题，所以需要循环遍历 B 和 T
     for (int i = 0; i < BT; i++) {
         int t = i % T;
         int ix = inp[i];

@@ -25,6 +25,7 @@ version 3 is like version 2 but uses float4 reads/writes
 // ----------------------------------------------------------------------------
 // CPU code reference
 
+//HAVEREAD
 // GPT-2 positional encoder forward pass
 void encoder_forward_cpu(float* out,
                    const int* inp, const float* wte, const float* wpe,

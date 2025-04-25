@@ -155,7 +155,25 @@ __global__ void fused_residual_forward2(floatX* residual, floatX* normed, floatX
     mean[idx] = (floatX)m;
     rstd[idx] = (floatX)s;
 }
+/*
+在forward2中，每个线程并行处理一个token的数据，但对通道（C维度）的处理是串行进行的。这样的设计会导致内存访问不连续（uncoalesced），从而大大降低性能。
+而在forward3中，将线程块组织为二维： 
+• 横向（threadIdx.x）固定为warp大小（32），用于处理token中各个通道的数据； 
+• 纵向（threadIdx.y）则表示独立token的数量。
 
+这样设计的好处有两个：
+    协同计算和内存访问合并： 
+        – 每个warp负责一个token的数据计算，线程组内的线程可以协同完成对一个token中C维数据的求和、归一化等操作。 
+        – 数据读取时，线程（例如threadIdx.x = 0, 1, 2, …）沿着通道方向顺序访问数组，从而能使内存访问更加连续（coalesced），减少内存访问延迟。
+
+    利用warp级别的高效归约操作： 
+        – 采用warpReduceSum进行归约操作，在warp内部实现了利用硬件支持的快速通信与归约，从而加速均值和方差的计算。 
+        – 保证每个token的处理都在单个warp内完成，避免了跨warp同步带来的开销。
+
+
+总结来说，将block从一维变成二维的主要原因是为了让每个warp独立处理一个token，从而： — 优化内存访问（合并访存） — 利用warp内部高效的协同运算（比如归约计算） — 提高整体的并行性能
+这样设计能在减少不连续内存访问和提高并行度的同时，更高效地对每个token进行归一化操作，并缓存后续反向传播所需要的均值和逆标准差。
+*/
 // handle one token per warp for coalesced access
 __global__ void fused_residual_forward3(floatX* residual, floatX* normed, floatX* mean, floatX* rstd,
                                         const floatX* inp1, const floatX* inp2,

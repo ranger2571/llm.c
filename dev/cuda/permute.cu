@@ -77,7 +77,7 @@ Similarly we can follow the above approach to permute matrices of any dimensions
 #include <cmath>
 
 #include "common.h"
-
+//这个函数就是对四维数据做维度置换（从(dim1, dim2, dim3, dim4)到(dim4, dim3, dim1, dim2)），使得数据在内存中的排列顺序发生变化。
 // CPU function to permute a 4D matrix
 void permute_cpu(const float* matrix, float* out_matrix, int dim1, int dim2, int dim3, int dim4) {
     int total_threads = dim1 * dim2 * dim3 * dim4;
